@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_type:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - none
+        default: 'patch'
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.new_version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Calculate new version
+        id: new_version
+        run: |
+          # Matches VERSION = "x.y.z" in your specific file path
+          CURRENT=$(grep -oP 'VERSION = "\K[^"]+' lib/langfuse/cli/version.rb)
+          
+          if [ "${{ inputs.version_type }}" = "none" ]; then
+             echo "version=$CURRENT" >> $GITHUB_OUTPUT
+             echo "Using existing version: $CURRENT"
+          else
+             IFS='.' read -r M m p <<< "$CURRENT"
+             case "${{ inputs.version_type }}" in
+               major) M=$((M+1)); m=0; p=0 ;;
+               minor) m=$((m+1)); p=0 ;;
+               patch) p=$((p+1)) ;;
+             esac
+             NEW_VER="$M.$m.$p"
+             echo "version=$NEW_VER" >> $GITHUB_OUTPUT
+             echo "Bumping to: $NEW_VER"
+          fi
+
+      - name: Update & Commit Version
+        if: ${{ inputs.version_type != 'none' }}
+        run: |
+          VER="${{ steps.new_version.outputs.version }}"
+          ruby -i -pe "sub(/VERSION = \".*\"/, \"VERSION = \\\"$VER\\\"\")" lib/langfuse/cli/version.rb
+          
+          git add lib/langfuse/cli/version.rb
+          git commit -m "chore: bump version to $VER"
+          git push
+
+      - name: Create Git Tag
+        run: |
+          VER="${{ steps.new_version.outputs.version }}"
+          if ! git rev-parse "v$VER" >/dev/null 2>&1; then
+            git tag -a "v$VER" -m "Release v$VER"
+            git push origin "v$VER"
+          fi
+
+      - name: Create GitHub Release
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER="${{ steps.new_version.outputs.version }}"
+          # Try to create release. If it exists, we just continue.
+          gh release create "v$VER" \
+            --title "v$VER" \
+            --generate-notes \
+            --draft=false \
+            --prerelease=false || echo "Release likely already exists..."
+
+  build-binaries:
+    needs: prepare-release
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_name: lf-linux
+          - os: macos-latest
+            asset_name: lf-macos
+          - os: windows-latest
+            asset_name: lf-windows.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+
+      - name: Install Tebako
+        run: |
+          gem install tebako
+          bundle install
+
+      - name: Compile Binary
+        run: |
+          tebako press \
+            --entry-point=bin/lf \
+            --root=. \
+            --output=output_bin \
+            --Ruby=3.2.7
+
+      - name: Rename Output
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            mv output_bin.exe ${{ matrix.asset_name }}
+          else
+            mv output_bin ${{ matrix.asset_name }}
+          fi
+
+      - name: Upload to Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "v${{ needs.prepare-release.outputs.version }}" ${{ matrix.asset_name }} --clobber
